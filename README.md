@@ -83,6 +83,21 @@ VMAS 是一个向量化多智能体仿真环境库，包含多个任务场景。
 
 > 证明加入 reward shaping 后，相比原始 MAPPO baseline，策略能够学到更安全、更高效、更平滑的导航行为。
 
+### 3.3 消融实验（planned）
+为了验证每个 shaping term 的贡献，计划采用逐步叠加的消融设计：
+
+- **A**: 仅 `r_task`（MAPPO baseline）
+- **B**: A + `r_progress`
+- **C**: B + `r_safety`
+- **D**: C + `r_smooth`（完整方案）
+
+其中：
+- A vs B：观察稀疏奖励稠密化的主要贡献
+- B vs C：观察安全惩罚对碰撞行为的影响
+- C vs D：观察平滑项对轨迹质量与训练稳定性的影响
+
+当前优先级上，首先确保 **baseline** 与 **完整改进版 D** 跑通并形成主结果；若时间允许，再补完整消融。
+
 ---
 
 ## 4. 当前 reward shaping 的设计思路
@@ -154,8 +169,8 @@ low_altitude_marl/
 ### notebooks/
 - `colab_smoke_test.ipynb`：早期 smoke test 与探索记录
 - `colab_baseline_v1.ipynb`：干净的 baseline 运行 notebook
-- `colab_reward_shaping_v1.ipynb`：改进版准备 notebook（设计与结构确认）
-- `colab_reward_shaping_run_v1.ipynb`：改进版正式运行 notebook
+- `colab_reward_shaping_v1.ipynb`：reward shaping 的 **dry-run / 结构检查 notebook**，用于确认设计文档、项目结构与核心脚本位置
+- `colab_reward_shaping_run_v1.ipynb`：reward shaping 的 **正式训练 notebook**，用于实际运行改进版实验并产出结果
 
 ### src/
 - `metrics_summary.py`：读取并汇总 BenchMARL 输出结果
@@ -184,6 +199,10 @@ low_altitude_marl/
   seed=0
 ```
 
+说明：
+- README 中保留的 `60000` 帧主要用于 **快速验证代码与输出流程是否跑通**。
+- 对 `navigation` 任务而言，正式实验更建议拉高到 **200k–500k frames**，这样收敛曲线通常更稳定，结果也更有说服力。
+
 ### 6.2 reward shaping 改进版
 使用 notebook：
 
@@ -202,6 +221,8 @@ low_altitude_marl/
 ```
 
 这里不是直接调用原始 `benchmarl.run`，而是先进入 `src/run_reward_shaping_v1.py`，由该脚本先 patch `VMAS/navigation` 的 reward，再在同一进程中启动训练。
+
+正式对比实验中，也建议把改进版的帧数同步提高到 **200k–500k frames**，保持与 baseline 的训练预算一致。
 
 ---
 
@@ -232,7 +253,8 @@ low_altitude_marl/
 5. 补充至少一个效果展示：
    - success rate / collision rate / path length
    - 或轨迹可视化
-6. 根据结果撰写实验分析与报告
+6. 若时间允许，补充 reward shaping 的逐项消融实验
+7. 根据结果撰写实验分析与报告
 
 ---
 
