@@ -1,150 +1,142 @@
 from __future__ import annotations
 
+import pathlib
 import runpy
 import sys
-from typing import Dict
-
-import torch
 
 
-def _safe_tensor(x, like: torch.Tensor | None = None) -> torch.Tensor | None:
-    if x is None:
-        return None
-    if isinstance(x, torch.Tensor):
-        return x
-    if like is not None:
-        return torch.as_tensor(x, dtype=like.dtype, device=like.device)
-    return torch.as_tensor(x)
+def _find_navigation_py() -> pathlib.Path:
+    candidates = [
+        pathlib.Path("/usr/local/lib/python3.12/dist-packages/vmas/scenarios/navigation.py"),
+        pathlib.Path("/usr/local/lib/python3.11/dist-packages/vmas/scenarios/navigation.py"),
+        pathlib.Path("/usr/local/lib/python3.10/dist-packages/vmas/scenarios/navigation.py"),
+        pathlib.Path("/usr/local/lib/python3.9/dist-packages/vmas/scenarios/navigation.py"),
+        pathlib.Path("/usr/local/lib/python3.8/dist-packages/vmas/scenarios/navigation.py"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Could not locate VMAS navigation.py under common site-packages paths."
+    )
 
 
-def patch_navigation_reward() -> None:
-    import vmas.scenarios.navigation as navigation
+def patch_navigation_reward() -> pathlib.Path:
+    nav_path = _find_navigation_py()
+    src = nav_path.read_text(encoding="utf-8")
 
-    Scenario = navigation.Scenario
-    original_reward = Scenario.reward
-    original_reset_world_at = Scenario.reset_world_at
+    marker = "# [rs_patch]"
+    if marker in src:
+        src = src[: src.index(marker)].rstrip()
+        print("[reward_shaping_v1] removed old reward-shaping patch")
 
-    def _get_agent_key(agent) -> str:
-        return getattr(agent, "name", str(id(agent)))
+    patch = r'''
+# [rs_patch]
+import torch as _torch
 
-    def _distance_to_goal(agent):
-        goal = getattr(agent, "goal", None)
-        agent_pos = getattr(getattr(agent, "state", None), "pos", None)
-        goal_pos = getattr(getattr(goal, "state", None), "pos", None)
-        if agent_pos is None or goal_pos is None:
-            return None
-        return torch.linalg.vector_norm(agent_pos - goal_pos, dim=-1)
+_rs_orig_reward = Scenario.reward
+_rs_orig_reset = Scenario.reset_world_at
 
-    def _action_tensor(agent):
-        action = getattr(agent, "action", None)
-        u = getattr(action, "u", None)
-        if u is None:
-            return None
-        return u
 
-    def _min_obstacle_distance(self, agent):
-        agent_pos = getattr(getattr(agent, "state", None), "pos", None)
-        if agent_pos is None:
-            return None
+def _rs_reset(self, env_index=None):
+    out = _rs_orig_reset(self, env_index)
+    if not hasattr(self, "_rs_pd"):
+        self._rs_pd = {}
+        self._rs_pa = {}
+    if env_index is None:
+        self._rs_pd.clear()
+        self._rs_pa.clear()
+    else:
+        for d in (self._rs_pd, self._rs_pa):
+            for k, v in list(d.items()):
+                if isinstance(v, _torch.Tensor) and v.ndim > 0 and env_index < v.shape[0]:
+                    v = v.clone()
+                    v[env_index] = 0.0
+                    d[k] = v
+    return out
 
-        agent_radius = 0.0
+
+def _rs_reward(self, agent):
+    base = _rs_orig_reward(self, agent)
+    if not isinstance(base, _torch.Tensor):
+        return base
+
+    r = base.clone()
+    zero = _torch.zeros_like(r)
+
+    if not hasattr(self, "_rs_pd"):
+        self._rs_pd = {}
+        self._rs_pa = {}
+
+    key = getattr(agent, "name", str(id(agent)))
+    ap = getattr(getattr(agent, "state", None), "pos", None)
+    gp = getattr(getattr(getattr(agent, "goal", None), "state", None), "pos", None)
+    dist = _torch.linalg.vector_norm(ap - gp, dim=-1) if (ap is not None and gp is not None) else None
+
+    prog = zero
+    if dist is not None:
+        pd = self._rs_pd.get(key)
+        if pd is not None and pd.shape == dist.shape:
+            prog = 0.1 * (pd - dist)
+        self._rs_pd[key] = dist.detach().clone()
+
+    smooth = zero
+    act = getattr(getattr(agent, "action", None), "u", None)
+    if act is not None:
+        pa = self._rs_pa.get(key)
+        if pa is not None and pa.shape == act.shape:
+            smooth = 0.01 * _torch.linalg.vector_norm(act - pa, dim=-1)
+        self._rs_pa[key] = act.detach().clone()
+
+    risk = zero
+    world = getattr(self, "world", None)
+    landmarks = getattr(world, "landmarks", []) if world else []
+    mc = None
+
+    ar = 0.0
+    try:
+        ar = float(getattr(getattr(agent, "shape", None), "radius", 0.0))
+    except Exception:
+        pass
+
+    for lm in landmarks:
+        if lm is getattr(agent, "goal", None):
+            continue
+        lp = getattr(getattr(lm, "state", None), "pos", None)
+        if lp is None or ap is None:
+            continue
+        lr = 0.0
         try:
-            agent_radius = float(getattr(getattr(agent, "shape", None), "radius", 0.0))
+            lr = float(getattr(getattr(lm, "shape", None), "radius", 0.0))
         except Exception:
-            agent_radius = 0.0
+            pass
+        cl = _torch.linalg.vector_norm(ap - lp, dim=-1) - ar - lr
+        mc = cl if mc is None else _torch.minimum(mc, cl)
 
-        world = getattr(self, "world", None)
-        landmarks = getattr(world, "landmarks", []) if world is not None else []
+    if mc is not None:
+        thr = _torch.as_tensor(0.15, dtype=mc.dtype, device=mc.device)
+        risk = 0.1 * _torch.relu(thr - mc)
 
-        min_clearance = None
-        for lm in landmarks:
-            if lm is getattr(agent, "goal", None):
-                continue
-            lm_pos = getattr(getattr(lm, "state", None), "pos", None)
-            if lm_pos is None:
-                continue
-            lm_radius = 0.0
-            try:
-                lm_radius = float(getattr(getattr(lm, "shape", None), "radius", 0.0))
-            except Exception:
-                lm_radius = 0.0
-            center_dist = torch.linalg.vector_norm(agent_pos - lm_pos, dim=-1)
-            clearance = center_dist - agent_radius - lm_radius
-            min_clearance = clearance if min_clearance is None else torch.minimum(min_clearance, clearance)
-        return min_clearance
+    return r + prog - smooth - risk
 
-    def patched_reset_world_at(self, env_index=None):
-        out = original_reset_world_at(self, env_index)
-        if not hasattr(self, "_reward_shaping_prev_dist"):
-            self._reward_shaping_prev_dist: Dict[str, torch.Tensor] = {}
-        if not hasattr(self, "_reward_shaping_prev_action"):
-            self._reward_shaping_prev_action: Dict[str, torch.Tensor] = {}
 
-        if env_index is None:
-            self._reward_shaping_prev_dist.clear()
-            self._reward_shaping_prev_action.clear()
-        else:
-            for key, value in list(self._reward_shaping_prev_dist.items()):
-                if isinstance(value, torch.Tensor) and value.ndim > 0 and env_index < value.shape[0]:
-                    value = value.clone()
-                    value[env_index] = 0.0
-                    self._reward_shaping_prev_dist[key] = value
-            for key, value in list(self._reward_shaping_prev_action.items()):
-                if isinstance(value, torch.Tensor) and value.ndim > 0 and env_index < value.shape[0]:
-                    value = value.clone()
-                    value[env_index] = 0.0
-                    self._reward_shaping_prev_action[key] = value
-        return out
+Scenario.reward = _rs_reward
+Scenario.reset_world_at = _rs_reset
+print("[rs_patch] reward shaping patch applied")
+'''
 
-    def patched_reward(self, agent):
-        base_reward = original_reward(self, agent)
-        reward = base_reward.clone() if isinstance(base_reward, torch.Tensor) else base_reward
+    src = src + "\n\n" + patch + "\n"
+    nav_path.write_text(src, encoding="utf-8")
 
-        if not hasattr(self, "_reward_shaping_prev_dist"):
-            self._reward_shaping_prev_dist = {}
-        if not hasattr(self, "_reward_shaping_prev_action"):
-            self._reward_shaping_prev_action = {}
+    pycache_dir = nav_path.parent / "__pycache__"
+    for pyc in pycache_dir.glob("navigation.cpython-*.pyc"):
+        try:
+            pyc.unlink()
+        except Exception:
+            pass
 
-        key = _get_agent_key(agent)
-        dist = _distance_to_goal(agent)
-        action_u = _action_tensor(agent)
-        min_clearance = _min_obstacle_distance(self, agent)
-
-        if isinstance(reward, torch.Tensor):
-            zero = torch.zeros_like(reward)
-        else:
-            return base_reward
-
-        # progress reward: closer to goal than previous step
-        progress_bonus = zero
-        if dist is not None:
-            prev_dist = self._reward_shaping_prev_dist.get(key)
-            if prev_dist is not None and isinstance(prev_dist, torch.Tensor) and prev_dist.shape == dist.shape:
-                progress = prev_dist - dist
-                progress_bonus = 0.3 * progress
-            self._reward_shaping_prev_dist[key] = dist.detach().clone()
-
-        # smoothness penalty: discourage abrupt action changes
-        smooth_penalty = zero
-        if action_u is not None:
-            prev_action = self._reward_shaping_prev_action.get(key)
-            if prev_action is not None and isinstance(prev_action, torch.Tensor) and prev_action.shape == action_u.shape:
-                action_delta = torch.linalg.vector_norm(action_u - prev_action, dim=-1)
-                smooth_penalty = 0.05 * action_delta
-            self._reward_shaping_prev_action[key] = action_u.detach().clone()
-
-        # risk penalty: penalize being too close to obstacles
-        risk_penalty = zero
-        if min_clearance is not None:
-            threshold = _safe_tensor(0.15, like=min_clearance)
-            risk_penalty = 0.2 * torch.relu(threshold - min_clearance)
-
-        shaped_reward = reward + progress_bonus - smooth_penalty - risk_penalty
-        return shaped_reward
-
-    Scenario.reset_world_at = patched_reset_world_at
-    Scenario.reward = patched_reward
-    print("[reward_shaping_v1] Patched vmas.scenarios.navigation.Scenario.reward")
+    print(f"[reward_shaping_v1] patched {nav_path}")
+    return nav_path
 
 
 def main() -> None:
