@@ -119,7 +119,7 @@ def _rs_reward(self, agent):
     gp = getattr(getattr(getattr(agent, "goal", None), "state", None), "pos", None)
     dist = _torch.linalg.vector_norm(ap - gp, dim=-1) if (ap is not None and gp is not None) else None
 
-    # 1) Progress reward: alpha_p * (d_{t-1} - d_t)
+    # 1) Progress reward: alpha_p times previous-distance minus current-distance.
     prog = zero
     if dist is not None:
         pd = self._rs_pd.get(key)
@@ -127,7 +127,7 @@ def _rs_reward(self, agent):
             prog = _RS_ALPHA_PROGRESS * (pd - dist)
         self._rs_pd[key] = dist.detach().clone()
 
-    # 2) Smoothness penalty: alpha_m * ||a_t - a_{t-1}||_2
+    # 2) Smoothness penalty: alpha_m times the L2 norm of action difference.
     smooth = zero
     act = getattr(getattr(agent, "action", None), "u", None)
     if act is not None:
