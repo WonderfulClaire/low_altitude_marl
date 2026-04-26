@@ -1,8 +1,36 @@
 from __future__ import annotations
 
+"""Reward-shaping v1 launcher aligned with the thesis method section.
+
+This script patches the installed VMAS ``navigation.py`` scenario in the current
+Python process and then launches ``benchmarl.run``. The coefficients are kept
+consistent with the thesis text:
+
+    alpha_p = 0.5    # progress reward
+    alpha_s = 0.05   # safety penalty
+    alpha_m = 0.005  # smoothness penalty
+    d_safe  = 0.15
+
+Recommended usage:
+    python src/restore_vmas_navigation.py
+    python src/run_reward_shaping_v1.py \
+        algorithm=mappo \
+        task=vmas/navigation \
+        experiment.render=false \
+        experiment.evaluation=false \
+        experiment.max_n_frames=300000 \
+        seed=0
+"""
+
 import pathlib
 import runpy
 import sys
+
+
+ALPHA_PROGRESS = 0.5
+ALPHA_SAFETY = 0.05
+ALPHA_SMOOTH = 0.005
+SAFE_DISTANCE = 0.15
 
 
 def _find_navigation_py() -> pathlib.Path:
@@ -16,6 +44,17 @@ def _find_navigation_py() -> pathlib.Path:
     for path in candidates:
         if path.exists():
             return path
+
+    try:
+        import vmas  # type: ignore
+
+        root = pathlib.Path(vmas.__file__).resolve().parent
+        candidate = root / "scenarios" / "navigation.py"
+        if candidate.exists():
+            return candidate
+    except Exception:
+        pass
+
     raise FileNotFoundError(
         "Could not locate VMAS navigation.py under common site-packages paths."
     )
@@ -25,24 +64,31 @@ def patch_navigation_reward() -> pathlib.Path:
     nav_path = _find_navigation_py()
     src = nav_path.read_text(encoding="utf-8")
 
-    marker = "# [rs_patch]"
-    if marker in src:
-        src = src[: src.index(marker)].rstrip()
-        print("[reward_shaping_v1] removed old reward-shaping patch")
+    # Remove any previous project patches. This is important in Colab because
+    # previous APF-AW or reward-shaping runs modify site-packages in place.
+    for marker in ["# [apf_aw_patch]", "# [rs_patch]"]:
+        if marker in src:
+            src = src[: src.index(marker)].rstrip()
+            print(f"[reward_shaping_v1] removed old patch marker: {marker}")
 
-    patch = r'''
+    patch = f'''
 # [rs_patch]
 import torch as _torch
 
 _rs_orig_reward = Scenario.reward
 _rs_orig_reset = Scenario.reset_world_at
 
+_RS_ALPHA_PROGRESS = float({ALPHA_PROGRESS})
+_RS_ALPHA_SAFETY = float({ALPHA_SAFETY})
+_RS_ALPHA_SMOOTH = float({ALPHA_SMOOTH})
+_RS_SAFE_DISTANCE = float({SAFE_DISTANCE})
+
 
 def _rs_reset(self, env_index=None):
     out = _rs_orig_reset(self, env_index)
     if not hasattr(self, "_rs_pd"):
-        self._rs_pd = {}
-        self._rs_pa = {}
+        self._rs_pd = {{}}
+        self._rs_pa = {{}}
     if env_index is None:
         self._rs_pd.clear()
         self._rs_pa.clear()
@@ -65,29 +111,32 @@ def _rs_reward(self, agent):
     zero = _torch.zeros_like(r)
 
     if not hasattr(self, "_rs_pd"):
-        self._rs_pd = {}
-        self._rs_pa = {}
+        self._rs_pd = {{}}
+        self._rs_pa = {{}}
 
     key = getattr(agent, "name", str(id(agent)))
     ap = getattr(getattr(agent, "state", None), "pos", None)
     gp = getattr(getattr(getattr(agent, "goal", None), "state", None), "pos", None)
     dist = _torch.linalg.vector_norm(ap - gp, dim=-1) if (ap is not None and gp is not None) else None
 
+    # 1) Progress reward: alpha_p * (d_{t-1} - d_t)
     prog = zero
     if dist is not None:
         pd = self._rs_pd.get(key)
         if pd is not None and pd.shape == dist.shape:
-            prog = 0.1 * (pd - dist)
+            prog = _RS_ALPHA_PROGRESS * (pd - dist)
         self._rs_pd[key] = dist.detach().clone()
 
+    # 2) Smoothness penalty: alpha_m * ||a_t - a_{t-1}||_2
     smooth = zero
     act = getattr(getattr(agent, "action", None), "u", None)
     if act is not None:
         pa = self._rs_pa.get(key)
         if pa is not None and pa.shape == act.shape:
-            smooth = 0.01 * _torch.linalg.vector_norm(act - pa, dim=-1)
+            smooth = _RS_ALPHA_SMOOTH * _torch.linalg.vector_norm(act - pa, dim=-1)
         self._rs_pa[key] = act.detach().clone()
 
+    # 3) Safety penalty around non-goal landmarks.
     risk = zero
     world = getattr(self, "world", None)
     landmarks = getattr(world, "landmarks", []) if world else []
@@ -114,26 +163,31 @@ def _rs_reward(self, agent):
         mc = cl if mc is None else _torch.minimum(mc, cl)
 
     if mc is not None:
-        thr = _torch.as_tensor(0.15, dtype=mc.dtype, device=mc.device)
-        risk = 0.1 * _torch.relu(thr - mc)
+        thr = _torch.as_tensor(_RS_SAFE_DISTANCE, dtype=mc.dtype, device=mc.device)
+        risk = _RS_ALPHA_SAFETY * _torch.relu(thr - mc)
 
     return r + prog - smooth - risk
 
 
 Scenario.reward = _rs_reward
 Scenario.reset_world_at = _rs_reset
-print("[rs_patch] reward shaping patch applied")
+print(
+    "[rs_patch] reward shaping patch applied "
+    f"alpha_p={{_RS_ALPHA_PROGRESS}}, alpha_s={{_RS_ALPHA_SAFETY}}, "
+    f"alpha_m={{_RS_ALPHA_SMOOTH}}, d_safe={{_RS_SAFE_DISTANCE}}"
+)
 '''
 
     src = src + "\n\n" + patch + "\n"
     nav_path.write_text(src, encoding="utf-8")
 
     pycache_dir = nav_path.parent / "__pycache__"
-    for pyc in pycache_dir.glob("navigation.cpython-*.pyc"):
-        try:
-            pyc.unlink()
-        except Exception:
-            pass
+    if pycache_dir.exists():
+        for pyc in pycache_dir.glob("navigation.cpython-*.pyc"):
+            try:
+                pyc.unlink()
+            except Exception:
+                pass
 
     print(f"[reward_shaping_v1] patched {nav_path}")
     return nav_path
